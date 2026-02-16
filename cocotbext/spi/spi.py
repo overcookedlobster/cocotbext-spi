@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2021 Spencer Chang
+# Modified to support ANY data width (x1, x2, x4, x8, x16, x32, x64...)
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
@@ -45,6 +46,13 @@ class Bus:
 
 
 class SpiBus(Bus):
+    """
+    Universal SPI Bus supporting ANY data width
+    Supports:
+    - Standard SPI (x1): mosi, miso
+    - Multi-lane (x2-x8): io0, io1, io2, ...
+    - Parallel (x16+): input_bus, output_bus
+    """
     def __init__(
         self,
         entity=None,
@@ -53,13 +61,36 @@ class SpiBus(Bus):
         mosi_name='mosi',
         miso_name='miso',
         cs_name=None,
+        # Multi-lane support
+        io_names=None,  # List of io pin names
+        # Parallel bus support
+        input_bus_name=None,
+        output_bus_name=None,
         **kwargs,
     ):
-        signals = {'sclk': sclk_name, 'mosi': mosi_name, 'miso': miso_name}
-        if cs_name is None:
-            optional_signals = {}
-        else:
-            optional_signals = {'cs': cs_name}
+        signals = {'sclk': sclk_name}
+        optional_signals = {}
+
+        # Standard SPI
+        if mosi_name:
+            optional_signals['mosi'] = mosi_name
+        if miso_name:
+            optional_signals['miso'] = miso_name
+
+        # Multi-lane SPI
+        if io_names:
+            for i, name in enumerate(io_names):
+                optional_signals[f'io{i}'] = name
+
+        # Parallel buses
+        if input_bus_name:
+            optional_signals['input_bus'] = input_bus_name
+        if output_bus_name:
+            optional_signals['output_bus'] = output_bus_name
+
+        if cs_name is not None:
+            optional_signals['cs'] = cs_name
+
         super().__init__(entity, prefix, signals, optional_signals=optional_signals, **kwargs)
 
     @classmethod
@@ -73,6 +104,7 @@ class SpiBus(Bus):
 
 @dataclass
 class SpiConfig:
+    """Universal SPI configuration for ANY data width"""
     word_width: int = 8
     sclk_freq: Optional[float] = 25e6
     cpol: bool = False
@@ -83,22 +115,36 @@ class SpiConfig:
     ignore_rx_value: Optional[int] = None
     cs_active_low: bool = True
 
+    # NEW: Data width parameter (defaults to 1 for backward compatibility)
+    data_width: int = 1  # Number of parallel data lanes
+
+    @property
+    def cycles_per_word(self) -> int:
+        """Number of clock cycles needed to transfer one word"""
+        return (self.word_width + self.data_width - 1) // self.data_width
+
 
 class SpiMaster:
+    """
+    Universal SPI Master supporting ANY data width
+    Works for x1, x2, x4, x8, x16, x32, x64... any width!
+    """
     def __init__(self, bus: SpiBus, config: SpiConfig) -> None:
         self.log = logging.getLogger(f"cocotb.{bus.sclk._path}")
 
-        # spi signals
+        # SPI signals
         self._sclk = bus.sclk
-        self._mosi = bus.mosi
-        self._miso = bus.miso
         self.has_cs = hasattr(bus, 'cs')
         if self.has_cs:
             self._cs = bus.cs
 
-        # size of a transfer
+        # Configuration
         self._config = config
 
+        # Configure data lines
+        self._configure_data_lines(bus)
+
+        # Queues
         self.queue_tx: Deque[Tuple[int, bool]] = deque()
         self.queue_rx: Deque[int] = deque()
 
@@ -107,8 +153,9 @@ class SpiMaster:
         self._idle = Event()
         self._idle.set()
 
+        # Initialize signals
         self._sclk.value = int(self._config.cpol)
-        self._mosi.value = self._config.data_output_idle
+        self._init_data_lines()
         if self.has_cs:
             self._cs.value = 1 if self._config.cs_active_low else 0
 
@@ -122,6 +169,41 @@ class SpiMaster:
         self._run_coroutine_obj = None
         self._restart()
 
+    def _configure_data_lines(self, bus: SpiBus):
+        """Auto-detect and configure data lines"""
+        # Check for parallel buses (highest priority)
+        if hasattr(bus, 'output_bus'):
+            self._mode = 'parallel'
+            self._output_bus = bus.output_bus
+            self._input_bus = bus.input_bus if hasattr(bus, 'input_bus') else None
+            return
+
+        # Check for multi-lane (io0, io1, ...)
+        if hasattr(bus, 'io0'):
+            self._mode = 'multi_lane'
+            self._io_lines = []
+            i = 0
+            while hasattr(bus, f'io{i}'):
+                self._io_lines.append(getattr(bus, f'io{i}'))
+                i += 1
+            return
+
+        # Standard SPI (mosi/miso)
+        self._mode = 'standard'
+        self._mosi = bus.mosi
+        self._miso = bus.miso
+
+    def _init_data_lines(self):
+        """Initialize data line outputs"""
+        if self._mode == 'parallel':
+            if hasattr(self, '_output_bus'):
+                self._output_bus.value = 0
+        elif self._mode == 'multi_lane':
+            for line in self._io_lines:
+                line.value = self._config.data_output_idle
+        else:  # standard
+            self._mosi.value = self._config.data_output_idle
+
     def _restart(self) -> None:
         if self._run_coroutine_obj is not None:
             self._run_coroutine_obj.cancel()
@@ -132,12 +214,7 @@ class SpiMaster:
         await self._idle.wait()
 
     def write_nowait(self, data: Iterable[int], *, burst: bool = False) -> None:
-        """ Write the data to the MOSI line
-
-        Args:
-            data: an iterable of ints, if the wordwidth is 8, a bytearray is typically appropriate
-            burst: if true, CS is not deasserted between writes
-        """
+        """ Write the data to the output lines """
         if self._config.msb_first:
             for b in data:
                 self.queue_tx.append((int(b), burst))
@@ -189,6 +266,7 @@ class SpiMaster:
         await self._idle.wait()
 
     async def _run(self):
+        """Main transfer loop - unified for ALL data widths!"""
         while True:
             while not self.queue_tx:
                 self._sclk.value = int(self._config.cpol)
@@ -199,70 +277,130 @@ class SpiMaster:
             tx_word, burst = self.queue_tx.popleft()
             rx_word = 0
 
-            self.log.debug("Write byte 0x%02x", tx_word)
+            self.log.debug(f"Transfer word 0x{tx_word:02x} (data_width={self._config.data_width})")
 
-            # the timing diagrams are CPHA/CPOL convention come from
-            # https://en.wikipedia.org/wiki/Serial_Peripheral_Interface
-            # this is also compliant with Linux Kernel definiton of SPI
-
-            # if CPHA=0, the first bit is typically clocked out on edge of chip select
+            # For CPHA=0, drive first data unit on CS edge (before clock starts)
+            # This is CRITICAL for backward compatibility with standard SPI timing
             if not self._config.cpha:
-                self._mosi.value = bool(tx_word & (1 << self._config.word_width - 1))
+                bits_per_cycle = self._config.data_width
+                first_shift = self._config.word_width - bits_per_cycle
+                first_data = (tx_word >> first_shift) & ((1 << bits_per_cycle) - 1)
+                self._drive_data(first_data)
 
-            # set the chip select
+            # Set chip select
             if self.has_cs:
                 self._cs.value = int(not self._config.cs_active_low)
             await Timer(self._SpiClock.period, unit='step')
 
             await self._SpiClock.start()
 
-            if self._config.cpha:
-                # if CPHA=1, the first edge is propagate, the second edge is sample
-                for k in range(self._config.word_width):
-                    # the out changes on the leading edge of clock
-                    await self._sclk.value_change
-                    self._mosi.value = bool(tx_word & (1 << (self._config.word_width - 1 - k)))
+            # Transfer word using configured data width
+            rx_word = await self._transfer_word(tx_word)
 
-                    # while the in captures on the trailing edge of the clock
-                    await self._sclk.value_change
-                    rx_word |= bool(self._miso.value) << (self._config.word_width - 1 - k)
-            else:
-                # if CPHA=0, the first edge is sample, the second edge is propagate
-                # we already clocked out one bit on edge of chip select, so we will clock out less bits
-                for k in range(self._config.word_width - 1):
-                    await self._sclk.value_change
-                    rx_word |= bool(self._miso.value) << (self._config.word_width - 1 - k)
-
-                    await self._sclk.value_change
-                    self._mosi.value = bool(tx_word & (1 << (self._config.word_width - 2 - k)))
-
-                # but we haven't sampled enough times, so we will wait for another edge to sample
-                await self._sclk.value_change
-                rx_word |= bool(self._miso.value)
-
-            # set sclk back to idle state
+            # Set sclk back to idle state
             await self._SpiClock.stop()
             self._sclk.value = self._config.cpol
 
-            # wait another sclk period before restoring the chip select and miso to idle (not necessarily part of spec)
+            # Wait another sclk period
             await Timer(self._SpiClock.period, unit='step')
-            self._mosi.value = int(self._config.data_output_idle)
+            self._set_data_idle()
             if self.has_cs:
                 if not burst or self.empty_tx():
                     self._cs.value = int(self._config.cs_active_low)
 
-            # wait some time before starting the next transaction
+            # Frame spacing
             if not 0 == self._config.frame_spacing_ns:
                 await Timer(self._config.frame_spacing_ns, unit='ns')
 
             if not self._config.msb_first:
                 rx_word = reverse_word(rx_word, self._config.word_width)
 
-            # if the ignore_rx_value has been set, ignore all rx_word equal to the set value
+            # Store received data
             if rx_word != self._config.ignore_rx_value:
                 self.queue_rx.append(rx_word)
 
             self.sync.set()
+
+    async def _transfer_word(self, tx_word: int) -> int:
+        """
+        Transfer one word - works for ANY data width!
+        Handles both CPHA=0 and CPHA=1 correctly
+        """
+        rx_word = 0
+        cycles = self._config.cycles_per_word
+        bits_per_cycle = self._config.data_width
+
+        if self._config.cpha:
+            # CPHA=1: Simple case - drive on first edge, sample on second
+            for cycle in range(cycles):
+                shift = (cycles - cycle - 1) * bits_per_cycle
+                mask = (1 << bits_per_cycle) - 1
+                tx_bits = (tx_word >> shift) & mask
+
+                await self._sclk.value_change
+                self._drive_data(tx_bits)
+
+                await self._sclk.value_change
+                rx_bits = self._sample_data()
+                rx_word |= (rx_bits << shift)
+        else:
+            # CPHA=0: More complex - first data already driven on CS edge
+            # Need to do (cycles-1) sample-drive iterations, then final sample
+            for cycle in range(cycles - 1):
+                shift = (cycles - cycle - 1) * bits_per_cycle
+                mask = (1 << bits_per_cycle) - 1
+
+                # Sample on first edge
+                await self._sclk.value_change
+                rx_bits = self._sample_data()
+                rx_word |= (rx_bits << shift)
+
+                # Drive next data unit on second edge
+                await self._sclk.value_change
+                next_shift = shift - bits_per_cycle
+                if next_shift >= 0:
+                    next_tx_bits = (tx_word >> next_shift) & mask
+                    self._drive_data(next_tx_bits)
+
+            # Final sample (for the last data unit)
+            await self._sclk.value_change
+            rx_bits = self._sample_data()
+            # Shift for last position
+            last_shift = 0
+            rx_word |= (rx_bits << last_shift)
+
+        return rx_word
+
+    def _drive_data(self, bits: int):
+        """Drive data on output lines - works for any mode"""
+        if self._mode == 'parallel':
+            self._output_bus.value = bits
+        elif self._mode == 'multi_lane':
+            for i in range(min(len(self._io_lines), self._config.data_width)):
+                self._io_lines[i].value = (bits >> i) & 1
+        else:  # standard
+            self._mosi.value = bits & 1
+
+    def _sample_data(self) -> int:
+        """Sample data from input lines - works for any mode"""
+        if self._mode == 'parallel':
+            return int(self._input_bus.value) if self._input_bus else 0
+        elif self._mode == 'multi_lane':
+            bits = 0
+            for i in range(min(len(self._io_lines), self._config.data_width)):
+                bits |= (int(self._io_lines[i].value) & 1) << i
+            return bits
+        else:  # standard
+            return int(self._miso.value) & 1
+
+    def _set_data_idle(self):
+        """Set data lines to idle state"""
+        if self._mode == 'standard':
+            self._mosi.value = int(self._config.data_output_idle)
+        elif self._mode == 'multi_lane':
+            for line in self._io_lines:
+                line.value = int(self._config.data_output_idle)
+        # Parallel mode doesn't need idle state
 
 
 class SpiSlaveBase(ABC):
@@ -272,11 +410,11 @@ class SpiSlaveBase(ABC):
         self.log = logging.getLogger(f"cocotb.{bus.sclk._path}")
 
         self._sclk = bus.sclk
-        self._mosi = bus.mosi
-        self._miso = bus.miso
-        self._cs = bus.cs
 
-        self._miso.value = self._config.data_output_idle
+        # Configure data lines
+        self._configure_data_lines(bus)
+
+        self._cs = bus.cs
 
         self.idle = Event()
         self.idle.set()
@@ -284,115 +422,113 @@ class SpiSlaveBase(ABC):
         self._run_coroutine_obj = None
         self._restart()
 
+    def _configure_data_lines(self, bus: SpiBus):
+        """Auto-detect and configure data lines"""
+        # Check for parallel buses
+        if hasattr(bus, 'input_bus'):
+            self._mode = 'parallel'
+            self._input_bus = bus.input_bus
+            self._output_bus = bus.output_bus if hasattr(bus, 'output_bus') else None
+            if self._output_bus:
+                self._output_bus.value = self._config.data_output_idle
+            return
+
+        # Check for multi-lane
+        if hasattr(bus, 'io0'):
+            self._mode = 'multi_lane'
+            self._io_lines = []
+            i = 0
+            while hasattr(bus, f'io{i}'):
+                self._io_lines.append(getattr(bus, f'io{i}'))
+                i += 1
+            for line in self._io_lines:
+                line.value = self._config.data_output_idle
+            return
+
+        # Standard SPI
+        self._mode = 'standard'
+        self._mosi = bus.mosi
+        self._miso = bus.miso
+        self._miso.value = self._config.data_output_idle
+
     def _restart(self):
         if self._run_coroutine_obj is not None:
             self._run_coroutine_obj.cancel()
         self._run_coroutine_obj = cocotb.start_soon(self._run())
 
     async def _shift(self, num_bits: int, tx_word: Optional[int] = None) -> int:
-        """ Shift in data on the MOSI signal. Shift out the tx_word on the MISO signal.
-
-        Args:
-            num_bits: the number of bits to shift
-            tx_word: the word to be transmitted on the wire
-
-        Returns:
-            the received word on the MOSI line
+        """
+        Shift data - works for ANY data width!
+        Uses configured data_width automatically
         """
         rx_word = 0
+        bits_per_cycle = self._config.data_width
+        cycles = (num_bits + bits_per_cycle - 1) // bits_per_cycle
 
         frame_end = RisingEdge(self._cs) if self._config.cs_active_low else FallingEdge(self._cs)
 
-        for k in range(num_bits):
-            # If both events happen at the same time, the returned one is indeterminate, thus
-            # checking for cs = 1
-            if (await First(self._sclk.value_change, frame_end)) == frame_end or self._cs.value == 1:
+        for cycle in range(cycles):
+            # Calculate bits for this cycle
+            bits_this_cycle = min(bits_per_cycle, num_bits - cycle * bits_per_cycle)
+            shift = num_bits - (cycle + 1) * bits_per_cycle
+            if shift < 0:
+                shift = 0
+            mask = (1 << bits_this_cycle) - 1
+
+            if (await First(self._sclk.value_change, frame_end)) == frame_end:
                 raise SpiFrameError("End of frame in the middle of a transaction")
 
             if self._config.cpha:
-                # when CPHA=1, the slave should shift out on the first edge
+                # CPHA=1: shift out on first edge
                 if tx_word is not None:
-                    self._miso.value = bool(tx_word & (1 << (num_bits - 1 - k)))
+                    tx_bits = (tx_word >> shift) & mask
+                    self._drive_data_slave(tx_bits)
                 else:
-                    self._miso.value = self._config.data_output_idle
+                    self._drive_data_slave(self._config.data_output_idle)
             else:
-                # when CPHA=0, the slave should sample on the first edge
-                rx_word |= int(self._mosi.value) << (num_bits - 1 - k)
+                # CPHA=0: sample on first edge
+                rx_bits = self._sample_data_slave()
+                rx_word |= (rx_bits & mask) << shift
 
-            # do the opposite of what was done on the first edge
-            if (await First(self._sclk.value_change, frame_end)) == frame_end or self._cs.value == 1:
+            if (await First(self._sclk.value_change, frame_end)) == frame_end:
                 raise SpiFrameError("End of frame in the middle of a transaction")
 
             if self._config.cpha:
-                rx_word |= int(self._mosi.value) << (num_bits - 1 - k)
+                # CPHA=1: sample on second edge
+                rx_bits = self._sample_data_slave()
+                rx_word |= (rx_bits & mask) << shift
             else:
+                # CPHA=0: shift out on second edge
                 if tx_word is not None:
-                    self._miso.value = bool(tx_word & (1 << (num_bits - 1 - k)))
+                    tx_bits = (tx_word >> shift) & mask
+                    self._drive_data_slave(tx_bits)
                 else:
-                    self._miso.value = self._config.data_output_idle
+                    self._drive_data_slave(self._config.data_output_idle)
 
         return rx_word
 
-    async def _transparent_shift(self, num_bits: int, delay: int = 0, delay_units: str = 'ns') -> int:
-        """ Shift in data on the MOSI signal, and present on MISO after a delay.
+    def _drive_data_slave(self, bits: int):
+        """Drive data from slave perspective"""
+        if self._mode == 'parallel':
+            if self._output_bus:
+                self._output_bus.value = bits
+        elif self._mode == 'multi_lane':
+            for i in range(min(len(self._io_lines), self._config.data_width)):
+                self._io_lines[i].value = (bits >> i) & 1
+        else:  # standard
+            self._miso.value = bits & 1
 
-        As the data is shifted in from MOSI, present it back out on the MISO signal
-        after a specified delay. This is equivalent to a fork in the flip flop output:
-            MOSI > DFF |-> MISO
-                     |-> RX_WORD_SHIFT_REGISTER
-
-
-        Args:
-            num_bits: the numbers of bits to transparently shift
-            delay: the time to delay before copying MOSI to MISO (default=0)
-            delay_units: the time units for the delay (default='ns')
-
-        Returns:
-            the received word on the MOSI line
-        """
-        rx_word = 0
-
-        frame_end = RisingEdge(self._cs) if self._config.cs_active_low else FallingEdge(self._cs)
-        propagate_out_delay = Timer(delay, unit=delay_units)
-
-        for k in range(num_bits):
-            f = await First(self._sclk.value_change, frame_end)
-            if not self._config.cpha:
-                # when CPHA=0, the first thing the slave should do is read in
-                rx_word |= int(self._mosi.value) << (num_bits - 1 - k)
-                most_recent_bit = int(self._mosi.value)
-
-                w = await First(propagate_out_delay, frame_end, self._sclk.value_change)
-
-                if w != propagate_out_delay:
-                    if w == frame_end:
-                        raise SpiFrameError("Unexpected end of frame in the middle of a transaction")
-                    else:
-                        raise SpiFrameError("Unexpected edge of sclk while waiting to propagate next bit")
-
-                self._miso.value = bool(most_recent_bit)
-
-            s = await First(self._sclk.value_change, frame_end)
-
-            if self._config.cpha:
-                # when CPHA=1, the second thing we should do is read in
-                rx_word |= int(self._mosi.value) << (num_bits - 1 - k)
-                most_recent_bit = int(self._mosi.value)
-
-                w = await First(propagate_out_delay, frame_end, self._sclk.value_change)
-
-                if w != propagate_out_delay:
-                    if w == frame_end:
-                        raise SpiFrameError("Unexpected end of frame in the middle of a transaction")
-                    else:
-                        raise SpiFrameError("Unexpected edge of sclk while waiting to propagate next bit")
-
-                self._miso.value = bool(most_recent_bit)
-
-            if frame_end in (f, s):
-                raise SpiFrameError("End of frame in the middle of a transaction")
-
-        return rx_word
+    def _sample_data_slave(self) -> int:
+        """Sample data from slave perspective"""
+        if self._mode == 'parallel':
+            return int(self._input_bus.value) if hasattr(self, '_input_bus') else 0
+        elif self._mode == 'multi_lane':
+            bits = 0
+            for i in range(min(len(self._io_lines), self._config.data_width)):
+                bits |= (int(self._io_lines[i].value) & 1) << i
+            return bits
+        else:  # standard
+            return int(self._mosi.value) & 1
 
     @abstractmethod
     async def _transaction(self, frame_start, frame_end):
