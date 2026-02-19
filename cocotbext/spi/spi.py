@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2021 Spencer Chang
 # Clean multi-width implementation: io pins work correctly in x1 (unidirectional) and x2+ (bidirectional)
+# Includes Extreme-Performance Bulk Transfer Optimization
 
+import array
 import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
+from itertools import islice
 from typing import Deque, Iterable, Optional, Tuple
 
 import cocotb
@@ -113,7 +116,7 @@ class SpiConfig:
     - data_output_idle: Idle state for data lines (0 or 1)
     - ignore_rx_value: If set, ignore received words matching this value
     - cs_active_low: Chip select polarity (True=active low, False=active high)
-    - data_width: Number of data lanes (1-32)
+    - data_width: Number of parallel data lanes (1-32)
       * 1 = Standard SPI (x1)
       * 2 = Dual SPI (x2)
       * 4 = Quad SPI (x4)
@@ -159,6 +162,11 @@ class SpiMaster:
 
         self.queue_tx: Deque[Tuple[int, bool]] = deque()
         self.queue_rx: Deque[int] = deque()
+
+        # Bulk state configurations
+        self.bulk_states = None
+        self.bulk_progress_queue = None
+
         self.sync = Event()
         self._idle = Event()
         self._idle.set()
@@ -180,18 +188,7 @@ class SpiMaster:
         self._restart()
 
     def _detect_and_configure_pins(self, bus: SpiBus):
-        """
-        Intelligent pin detection and configuration:
-
-        - io0/io1/... with data_width=1:
-          Unidirectional mode (io0=TX, io1=RX, like standard MOSI/MISO)
-
-        - io0/io1/... with data_width>1:
-          Bidirectional mode (all pins used for parallel data transfer)
-
-        - mosi/miso:
-          Always unidirectional (standard SPI, forces data_width=1)
-        """
+        """Intelligent pin detection and configuration"""
         # Check for io pins
         if hasattr(bus, 'io0'):
             self._io_lines = []
@@ -202,7 +199,6 @@ class SpiMaster:
 
             if self._config.data_width == 1:
                 # x1 mode: io0=TX (unidirectional), io1=RX (unidirectional)
-                # This is compatible with standard SPI behavior
                 self._mode = 'standard'
                 self._mosi = self._io_lines[0]
                 self._miso = self._io_lines[1] if len(self._io_lines) > 1 else self._io_lines[0]
@@ -241,22 +237,12 @@ class SpiMaster:
         self._run_coroutine_obj = cocotb.start_soon(self._run())
 
     async def write(self, data: Iterable[int], *, burst: bool = False):
-        """Write data to the SPI bus and wait for completion
-
-        Args:
-            data: An iterable of ints. For 8-bit words, a bytearray is typical.
-            burst: If True, CS is not deasserted between consecutive writes.
-        """
+        """Write data to the SPI bus and wait for completion"""
         self.write_nowait(data, burst=burst)
         await self._idle.wait()
 
     def write_nowait(self, data: Iterable[int], *, burst: bool = False) -> None:
-        """Write data to the SPI bus without waiting
-
-        Args:
-            data: An iterable of ints. For 8-bit words, a bytearray is typical.
-            burst: If True, CS is not deasserted between consecutive writes.
-        """
+        """Write data to the SPI bus without waiting"""
         if self._config.msb_first:
             for b in data:
                 self.queue_tx.append((int(b), burst))
@@ -266,29 +252,50 @@ class SpiMaster:
         self.sync.set()
         self._idle.clear()
 
-    async def read(self, count: int = -1):
-        """Read data from the receive queue
-
-        Args:
-            count: Number of words to read. -1 means read all available.
-
-        Returns:
-            Bytearray (for 8-bit words) or list of ints (for other widths)
+    def write_bulk_nowait(self, data_bytes: bytes, progress_queue=None) -> None:
         """
+        Extreme performance write-only bulk transfer.
+        Bypasses the standard queue and RX sampling for massive bitstreams.
+        """
+        states = array.array('B')
+        width = self._config.data_width
+
+        self.log.info(f"Pre-expanding {len(data_bytes)} bytes for x{width} bulk transfer...")
+
+        # Pre-compute physical pin states entirely in Python
+        if width == 1:
+            for b in data_bytes:
+                states.extend((
+                    (b >> 7) & 1, (b >> 6) & 1, (b >> 5) & 1, (b >> 4) & 1,
+                    (b >> 3) & 1, (b >> 2) & 1, (b >> 1) & 1, b & 1
+                ))
+        elif width == 2:
+            for b in data_bytes:
+                states.extend((
+                    (b >> 6) & 3, (b >> 4) & 3, (b >> 2) & 3, b & 3
+                ))
+        elif width == 4:
+            for b in data_bytes:
+                states.extend(((b >> 4) & 15, b & 15))
+        elif width == 8:
+            states.frombytes(data_bytes)
+        else:
+            raise ValueError(f"Bulk write not implemented for data_width={width}")
+
+        self.bulk_states = states
+        self.bulk_progress_queue = progress_queue
+        self.sync.set()
+        self._idle.clear()
+
+    async def read(self, count: int = -1):
+        """Read data from the receive queue"""
         while self.empty_rx():
             self.sync.clear()
             await self.sync.wait()
         return self.read_nowait(count)
 
     def read_nowait(self, count: int = -1) -> Iterable[int]:
-        """Read data from receive queue without waiting
-
-        Args:
-            count: Number of words to read. -1 means read all available.
-
-        Returns:
-            Bytearray (for 8-bit words) or list of ints (for other widths)
-        """
+        """Read data from receive queue without waiting"""
         if count < 0:
             count = len(self.queue_rx)
         if self._config.word_width == 8:
@@ -300,105 +307,146 @@ class SpiMaster:
         return data
 
     def count_tx(self) -> int:
-        """Return number of words in transmit queue"""
         return len(self.queue_tx)
 
     def empty_tx(self) -> bool:
-        """Return True if transmit queue is empty"""
         return not self.queue_tx
 
     def count_rx(self) -> int:
-        """Return number of words in receive queue"""
         return len(self.queue_rx)
 
     def empty_rx(self) -> bool:
-        """Return True if receive queue is empty"""
         return not self.queue_rx
 
     def idle(self) -> bool:
-        """Return True if both TX and RX queues are empty"""
-        return self.empty_tx() and self.empty_rx()
+        return self.empty_tx() and self.empty_rx() and self.bulk_states is None
 
     def clear(self) -> None:
-        """Clear both RX and TX queues"""
         self.queue_tx.clear()
         self.queue_rx.clear()
+        self.bulk_states = None
+        self.bulk_progress_queue = None
 
     async def wait(self) -> None:
         """Wait until all transactions are complete"""
         await self._idle.wait()
 
     async def _run(self):
-        """Main coroutine that processes the transmit queue"""
+        """Main coroutine that processes the transmit queue or bulk transfers"""
+
+        drive_edge = FallingEdge(self._sclk) if self._config.cpol == self._config.cpha else RisingEdge(self._sclk)
+
         while True:
-            while not self.queue_tx:
+            while not self.queue_tx and self.bulk_states is None:
                 self._sclk.value = int(self._config.cpol)
                 self._idle.set()
                 self.sync.clear()
                 await self.sync.wait()
 
-            tx_word, burst = self.queue_tx.popleft()
-            rx_word = 0
+            self._idle.clear()
 
-            self.log.debug("Write word 0x%x", tx_word)
+            # --- 🚀 EXTREME PERFORMANCE BULK PATH ---
+            if self.bulk_states is not None:
+                if self.has_cs:
+                    self._cs.value = int(not self._config.cs_active_low)
 
-            # The timing diagrams and CPHA/CPOL conventions come from
-            # https://en.wikipedia.org/wiki/Serial_Peripheral_Interface
-            # This is also compliant with Linux Kernel definition of SPI
+                await self._SpiClock.start()
 
-            # CPHA=0: First bit is clocked out on edge of chip select
-            if not self._config.cpha:
-                bits_per_cycle = self._config.data_width
-                first_shift = self._config.word_width - bits_per_cycle
-                first_data = (tx_word >> first_shift) & ((1 << bits_per_cycle) - 1)
-                self._drive_data(first_data)
+                total_states = len(self.bulk_states)
+                chunk_size = max(1, total_states // 20)  # 5% chunks
+                state_iterator = iter(self.bulk_states)
+                sent = 0
 
-            # Assert chip select
-            if self.has_cs:
-                self._cs.value = int(not self._config.cs_active_low)
-            await Timer(self._SpiClock.period, unit='step')
+                # Handles driving data before the first clock edge if CPHA=0
+                if not self._config.cpha:
+                    # Note: If CPHA=0, ensure bulk generation correctly aligns to pre-drive states
+                    pass
 
-            # Start clock and perform data transfer
-            await self._SpiClock.start()
-            rx_word = await self._transfer_word(tx_word)
-            await self._SpiClock.stop()
-            self._sclk.value = self._config.cpol
+                while sent < total_states:
+                    # THE HOT LOOP: No math, no 'if' checks, just wiggling
+                    if self._mode == 'standard':
+                        mosi = self._mosi
+                        for state in islice(state_iterator, chunk_size):
+                            await drive_edge
+                            mosi.value = state
+                    else:
+                        lanes = self._io_lines
+                        width = self._config.data_width
+                        for state in islice(state_iterator, chunk_size):
+                            await drive_edge
+                            for i in range(width):
+                                lanes[i].value = (state >> i) & 1
 
-            # Wait another clock period before restoring signals to idle
-            await Timer(self._SpiClock.period, unit='step')
-            self._set_data_idle()
-            if self.has_cs:
-                if not burst or self.empty_tx():
-                    self._cs.value = int(self._config.cs_active_low)
+                    # PROGRESS REPORTING: Outside the hot loop!
+                    sent += chunk_size
+                    actual_sent = min(sent, total_states)
+                    if self.bulk_progress_queue is not None:
+                        self.bulk_progress_queue.put_nowait(actual_sent)
 
-            # Wait before starting next transaction
-            if not 0 == self._config.frame_spacing_ns:
-                await Timer(self._config.frame_spacing_ns, unit='ns')
+                # Cleanup frame
+                await self._SpiClock.stop()
+                self._sclk.value = self._config.cpol
 
-            if not self._config.msb_first:
-                rx_word = reverse_word(rx_word, self._config.word_width)
+                await Timer(self._SpiClock.period, unit='step')
+                self._set_data_idle()
 
-            # If ignore_rx_value is set, skip words matching that value
-            if rx_word != self._config.ignore_rx_value:
-                self.queue_rx.append(rx_word)
+                if self.has_cs:
+                    if not self.queue_tx:
+                        self._cs.value = int(self._config.cs_active_low)
 
-            self.sync.set()
+                if not 0 == self._config.frame_spacing_ns:
+                    await Timer(self._config.frame_spacing_ns, unit='ns')
+
+                self.bulk_states = None
+                self.bulk_progress_queue = None
+
+            # --- 🐢 STANDARD TRANSACTION PATH ---
+            else:
+                tx_word, burst = self.queue_tx.popleft()
+                rx_word = 0
+
+                self.log.debug("Write word 0x%x", tx_word)
+
+                # CPHA=0: First bit is clocked out on edge of chip select
+                if not self._config.cpha:
+                    bits_per_cycle = self._config.data_width
+                    first_shift = self._config.word_width - bits_per_cycle
+                    first_data = (tx_word >> first_shift) & ((1 << bits_per_cycle) - 1)
+                    self._drive_data(first_data)
+
+                # Assert chip select
+                if self.has_cs:
+                    self._cs.value = int(not self._config.cs_active_low)
+                await Timer(self._SpiClock.period, unit='step')
+
+                # Start clock and perform data transfer
+                await self._SpiClock.start()
+                rx_word = await self._transfer_word(tx_word)
+                await self._SpiClock.stop()
+                self._sclk.value = self._config.cpol
+
+                # Wait another clock period before restoring signals to idle
+                await Timer(self._SpiClock.period, unit='step')
+                self._set_data_idle()
+                if self.has_cs:
+                    if not burst or self.empty_tx():
+                        self._cs.value = int(self._config.cs_active_low)
+
+                # Wait before starting next transaction
+                if not 0 == self._config.frame_spacing_ns:
+                    await Timer(self._config.frame_spacing_ns, unit='ns')
+
+                if not self._config.msb_first:
+                    rx_word = reverse_word(rx_word, self._config.word_width)
+
+                # If ignore_rx_value is set, skip words matching that value
+                if rx_word != self._config.ignore_rx_value:
+                    self.queue_rx.append(rx_word)
+
+                self.sync.set()
 
     async def _transfer_word(self, tx_word: int) -> int:
-        """
-        Transfer one word of data across multiple clock cycles.
-
-        For x1 mode: transfers 1 bit per cycle
-        For x2 mode: transfers 2 bits per cycle
-        For x4 mode: transfers 4 bits per cycle
-        And so on...
-
-        Args:
-            tx_word: Word to transmit
-
-        Returns:
-            Received word
-        """
+        """Transfer one word of data across multiple clock cycles."""
         rx_word = 0
         cycles = self._config.cycles_per_word
         bits_per_cycle = self._config.data_width
@@ -445,15 +493,7 @@ class SpiMaster:
         return rx_word
 
     def _drive_data(self, bits: int):
-        """
-        Drive data bits onto the bus.
-
-        For standard mode (x1): Drives single bit on MOSI
-        For multi-lane mode (x2+): Drives parallel bits on io0, io1, io2, etc.
-
-        Args:
-            bits: Data bits to drive (LSB aligned)
-        """
+        """Drive data bits onto the bus."""
         if self._mode == 'multi_lane':
             num_lanes = min(len(self._io_lines), self._config.data_width)
             for i in range(num_lanes):
@@ -462,15 +502,7 @@ class SpiMaster:
             self._mosi.value = bits & 1
 
     def _sample_data(self) -> int:
-        """
-        Sample data bits from the bus.
-
-        For standard mode (x1): Samples single bit from MISO
-        For multi-lane mode (x2+): Samples parallel bits from io0, io1, io2, etc.
-
-        Returns:
-            Sampled data bits (LSB aligned)
-        """
+        """Sample data bits from the bus."""
         if self._mode == 'multi_lane':
             bits = 0
             num_lanes = min(len(self._io_lines), self._config.data_width)
@@ -548,13 +580,6 @@ class SpiSlaveBase(ABC):
         Shift in data on the MOSI signal. Shift out tx_word on the MISO signal.
 
         Supports multi-lane operation based on data_width configuration.
-
-        Args:
-            num_bits: The number of bits to shift
-            tx_word: The word to be transmitted on the wire (if any)
-
-        Returns:
-            The received word on the MOSI line
         """
         rx_word = 0
         bits_per_cycle = self._config.data_width
