@@ -435,14 +435,19 @@ class SpiSlaveBase(ABC):
     async def _transaction(self, frame_start, frame_end): raise NotImplementedError()
 
     async def _run(self):
-        frame_start = FallingEdge(self._cs) if self._config.cs_active_low else RisingEdge(self._cs)
-        frame_end = RisingEdge(self._cs) if self._config.cs_active_low else FallingEdge(self._cs)
-        frame_spacing = Timer(self._config.frame_spacing_ns, unit='ns')
-        while True:
-            self.idle.set()
-            if (await First(frame_start, frame_spacing)) == frame_start:
-                raise SpiFrameError(f"Minimum {self._config.frame_spacing_ns} ns between frames")
-            await self._transaction(frame_start, frame_end)
+            frame_start = FallingEdge(self._cs) if self._config.cs_active_low else RisingEdge(self._cs)
+            frame_end   = RisingEdge(self._cs)  if self._config.cs_active_low else FallingEdge(self._cs)
+            while True:
+                self.idle.set()
+                if self._config.frame_spacing_ns > 0:
+                    # Recreate Timer each iteration — a consumed trigger cannot be re-awaited
+                    frame_spacing = Timer(self._config.frame_spacing_ns, unit='ns')
+                    if (await First(frame_start, frame_spacing)) == frame_start:
+                        raise SpiFrameError(
+                            f"Minimum {self._config.frame_spacing_ns} ns between frames"
+                        )
+                # frame_spacing_ns=0: no inter-frame gap enforcement, fall straight through
+                await self._transaction(frame_start, frame_end)
 
 
 class _SpiClock:
